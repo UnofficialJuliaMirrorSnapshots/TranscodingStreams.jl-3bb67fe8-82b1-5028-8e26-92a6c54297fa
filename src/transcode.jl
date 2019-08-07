@@ -77,11 +77,55 @@ julia> String(decompressed)
 ```
 """
 function Base.transcode(codec::Codec, data::ByteData)
-    # Add `minoutsize` because `transcode` will be called at least two times.
-    buffer2 = Buffer(
-        expectedsize(codec, Memory(data)) + minoutsize(codec, Memory(C_NULL, 0)))
-    mark!(buffer2)
-    stream = TranscodingStream(codec, devnull, State(Buffer(data), buffer2); initialized=true)
-    write(stream, TOKEN_END)
-    return takemarked!(buffer2)
+    input = Buffer(data)
+    output = Buffer(initial_output_size(codec, buffermem(input)))
+    error = Error()
+    code = startproc(codec, :write, error)
+    if code === :error
+        @goto error
+    end
+    n = minoutsize(codec, buffermem(input))
+    @label process
+    makemargin!(output, n)
+    Δin, Δout, code = process(codec, buffermem(input), marginmem(output), error)
+    @debug(
+        "called process()",
+        code = code,
+        input_size = buffersize(input),
+        output_size = marginsize(output),
+        input_delta = Δin,
+        output_delta = Δout,
+    )
+    consumed!(input, Δin)
+    supplied!(output, Δout)
+    if code === :error
+        @goto error
+    elseif code === :end
+        if buffersize(input) > 0
+            if startproc(codec, :write, error) === :error
+                @goto error
+            end
+            n = minoutsize(codec, buffermem(input))
+            @goto process
+        end
+        resize!(output.data, output.marginpos - 1)
+        return output.data
+    else
+        n = max(Δout, minoutsize(codec, buffermem(input)))
+        @goto process
+    end
+    @label error
+    if !haserror(error)
+        set_default_error!(error)
+    end
+    throw(error[])
+end
+
+# Return the initial output buffer size.
+function initial_output_size(codec::Codec, input::Memory)
+    return max(
+        minoutsize(codec, input),
+        expectedsize(codec, input),
+        8,  # just in case where both minoutsize and expectedsize are foolish
+    )
 end
